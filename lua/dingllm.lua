@@ -62,7 +62,25 @@ function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
     stream = true,
     max_tokens = 4096,
   }
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+
+  -- Create a temporary file and write JSON data
+  local temp_file = vim.fn.tempname()
+  local file, err = io.open(temp_file, "w")
+  if not file then
+    print("Error creating temporary file: " .. err)
+    return nil, nil
+  end
+  local success, write_err = pcall(function() file:write(vim.json.encode(data)) end)
+  if not success then
+    print("Error writing to temporary file: " .. write_err)
+    file:close()
+    vim.fn.delete(temp_file)
+    return nil, nil
+  end
+  file:close()
+
+  -- Use --data-binary to read from the file
+  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@' .. temp_file }
   if api_key then
     table.insert(args, '-H')
     table.insert(args, 'x-api-key: ' .. api_key)
@@ -70,7 +88,7 @@ function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
     table.insert(args, 'anthropic-version: 2023-06-01')
   end
   table.insert(args, url)
-  return args
+  return args, temp_file
 end
 
 function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
@@ -82,13 +100,31 @@ function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
     temperature = 0.7,
     stream = true,
   }
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+
+  -- Create a temporary file and write JSON data
+  local temp_file = vim.fn.tempname()
+  local file, err = io.open(temp_file, "w")
+  if not file then
+    print("Error creating temporary file: " .. err)
+    return nil, nil
+  end
+  local success, write_err = pcall(function() file:write(vim.json.encode(data)) end)
+  if not success then
+    print("Error writing to temporary file: " .. write_err)
+    file:close()
+    vim.fn.delete(temp_file)
+    return nil, nil
+  end
+  file:close()
+
+  -- Use --data-binary to read from the file
+  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@' .. temp_file }
   if api_key then
     table.insert(args, '-H')
     table.insert(args, 'Authorization: Bearer ' .. api_key)
   end
   table.insert(args, url)
-  return args
+  return args, temp_file
 end
 
 function M.make_gemini_spec_curl_args(opts, prompt, system_prompt)
@@ -98,37 +134,51 @@ function M.make_gemini_spec_curl_args(opts, prompt, system_prompt)
   local data = {
     contents = {
       {
-        parts = { { text = system_prompt } },
-        role = "model",
-      },
-      {
-        parts = { { text = prompt } },
         role = "user",
+        parts = { { text = prompt } },
       },
     },
   }
+  if system_prompt and system_prompt ~= "" then
+    data.systemInstruction = {
+      parts = { { text = system_prompt } },
+    }
+  end
 
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+  -- Create a temporary file and write JSON data
+  local temp_file = vim.fn.tempname()
+  local file, err = io.open(temp_file, "w")
+  if not file then
+    print("Error creating temporary file: " .. err)
+    return nil, nil
+  end
+  local success, write_err = pcall(function() file:write(vim.json.encode(data)) end)
+  if not success then
+    print("Error writing to temporary file: " .. write_err)
+    file:close()
+    vim.fn.delete(temp_file)
+    return nil, nil
+  end
+  file:close()
+
+  -- Use --data-binary to read from the file
+  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@' .. temp_file }
   table.insert(args, url)
-  return args
+  return args, temp_file
 end
 
 function M.write_string_at_extmark(str, buf_id, extmark_id)
   vim.schedule(function()
     if not vim.api.nvim_buf_is_valid(buf_id) then
-      -- Buffer might have been closed/invalid, exit early
       return
     end
 
     local extmark = vim.api.nvim_buf_get_extmark_by_id(buf_id, ns_id, extmark_id, { details = false })
     if not extmark then
-      -- Extmark might have been deleted, exit early
       return
     end
     local row, col = extmark[1], extmark[2]
 
-    -- Want to be able to remove all inserted text with single undo command, but
-    -- not supposed to call 'undojoin' in asyncronous callback.
     local success, err = pcall(vim.cmd, 'undojoin')
     if not success then
       if err:match 'E790' then
@@ -166,7 +216,7 @@ function M.handle_anthropic_spec_data(data_stream, buf_id, extmark_id, event_sta
   if event_state == 'content_block_delta' then
     local json = vim.json.decode(data_stream)
     if json.delta and json.delta.text then
-      M.write_string_at_extmark(buf_id, json.delta.text, extmark_id)
+      M.write_string_at_extmark(json.delta.text, buf_id, extmark_id)
     end
   end
 end
@@ -183,11 +233,6 @@ function M.handle_openai_spec_data(data_stream, buf_id, extmark_id)
   end
 end
 
--- Discrete version:
--- https://ai.google.dev/api/generate-content#v1beta.models.generateContent
---
--- Streaming version:
--- https://ai.google.dev/api/generate-content#v1beta.models.streamGenerateContent
 function M.handle_gemini_spec_data(data_stream, buf_id, extmark_id)
   if data_stream:match '"candidates":' then
     local json = vim.json.decode(data_stream)
@@ -219,36 +264,64 @@ end
 function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_data_fn)
   vim.api.nvim_clear_autocmds { group = group }
   local prompt = get_prompt(opts)
-  local system_prompt = opts.system_prompt or 'You are a tsundere uwu anime. Yell at me for not setting my configuration for my llm plugin correctly'
-  local args = make_curl_args_fn(opts, prompt, system_prompt)
+  if prompt == '' then
+      vim.notify("dingllm: Prompt is empty. Aborting.", vim.log.levels.WARN)
+      return
+  end
+
+  local system_prompt = opts.system_prompt or 'You are a helpful assistant.' -- Sensible default
+  local args, temp_file = make_curl_args_fn(opts, prompt, system_prompt)
+  if not args then
+    return
+  end
+
   local curr_event_state = nil
   local buf_id = vim.api.nvim_get_current_buf()
   local crow, _ = unpack(vim.api.nvim_win_get_cursor(0))
   local stream_end_extmark_id = vim.api.nvim_buf_set_extmark(buf_id, ns_id, crow - 1, -1, {})
 
+  -- Setup floating window
+  local status_buf = vim.api.nvim_create_buf(false, true)
+  -- These are INNER dimensions for content, when border is present
+  local initial_inner_win_width = 30
+  local initial_inner_win_height = 1
 
-  -- setup a floating window to show status of LLM request
-  local buf = vim.api.nvim_create_buf(false, true)
-  local width = 20
-  local height = 1
-  local win_opts = {
+  local status_win_opts = {
     relative = "editor",
     row = 0,
-    col = vim.o.columns - width,
-    width = width,
-    height = height,
+    -- Total width = inner_width + 2 (for left/right border parts)
+    col = vim.o.columns - (initial_inner_win_width + 2),
+    width = initial_inner_win_width,   -- Inner width
+    height = initial_inner_win_height, -- Inner height
     style = "minimal",
     border = "rounded",
     focusable = false,
+    noautocmd = true,
   }
-
-  local win = vim.api.nvim_open_win(buf, false, win_opts)
-  vim.api.nvim_win_set_option(win, 'winhl', 'Normal:NormalFloat')
+  local status_win = vim.api.nvim_open_win(status_buf, false, status_win_opts)
+  vim.api.nvim_win_set_option(status_win, 'winhl', 'Normal:NormalFloat,FloatBorder:NormalFloat')
 
   local function update_floating_window(message)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, true, { message })
-    local message_width = vim.fn.strdisplaywidth(message)
-    vim.api.nvim_win_set_width(win, message_width)
+    if vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf) then
+      vim.schedule(function() -- Deferring UI updates to the main loop is safer
+        if not (vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf)) then return end
+
+        vim.api.nvim_buf_set_lines(status_buf, 0, -1, true, { message })
+
+        local message_text_width = vim.fn.strdisplaywidth(message)
+        -- New inner width is the max of initial inner width and current message text width
+        local new_inner_width = math.max(initial_inner_win_width, message_text_width)
+
+        local new_config = {
+          relative = status_win_opts.relative, -- Must re-specify "relative"
+          row = status_win_opts.row,           -- Keep original row
+          col = vim.o.columns - (new_inner_width + 2), -- Recalculate col based on new total width
+          width = new_inner_width,             -- Set new inner width
+          height = status_win_opts.height,     -- Keep original inner height
+        }
+        vim.api.nvim_win_set_config(status_win, new_config)
+      end)
+    end
   end
 
   local function parse_and_call(line)
@@ -268,45 +341,80 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     active_job = nil
   end
 
-  -- Write the full curl command to a debug log file if enabled
   local curl_command = table.concat({'curl', unpack(args)}, ' ')
-  debug_write(opts, "REQUEST: " .. curl_command)
+  debug_write(opts, "REQUEST: " .. curl_command .. " (temp_file: " .. temp_file .. ")")
 
   local start_time = vim.loop.hrtime()
-  update_floating_window("Waiting for LLM...")
+  update_floating_window("LLM: Waiting...")
 
   active_job = Job:new {
     command = 'curl',
     args = args,
     on_stdout = function(_, out)
-      -- TODO: update status window with token count.
       parse_and_call(out)
       debug_write(opts, '\nRESPONSE: on_stdout: ' .. out)
     end,
-    on_stderr = function(_, err)
-      -- TODO: parse the bytes sent / recv to update floating window here.
-      debug_write(opts, '\nRESPONSE: on_stderr: ' .. err)
+    on_stderr = function(_, err_line)
+      if err_line == nil or err_line == "" then return end -- Ignore empty lines from stderr
+      -- Curl progress often goes to stderr. You might want to parse it.
+      -- For now, just log it.
+      debug_write(opts, 'RESPONSE STDERR: ' .. err_line)
+      -- Potentially update status window with stderr info if it's not progress
+      if not err_line:match('^%s*%%') and not err_line:match('^{"error":') then -- filter curl progress
+          -- Show first few critical errors, not all stderr
+          -- update_floating_window("LLM stderr: " .. err_line)
+      end
+      if err_line:match('^{"error":') then -- JSON error from API
+          local _, err_json = pcall(vim.json.decode, err_line)
+          if err_json and err_json.error and err_json.error.message then
+              update_floating_window("LLM API Error: " .. err_json.error.message)
+          else
+              update_floating_window("LLM API Error (raw): " .. err_line)
+          end
+          if temp_file then
+              local success, err = pcall(os.remove, temp_file)
+              if not success then
+                  print("Error deleting temporary file: " .. err)
+              end
+          end
+      end
     end,
-    on_exit = function(j, return_val)
-      local end_time = vim.loop.hrtime()
-      local elapsed_time_ms = (end_time - start_time) / 1000000
-      if return_val ~= 0 then
-        if return_val ~= nil then
-            vim.schedule(function()
-                update_floating_window(string.format("Error: %s", tostring(return_val)))
-            end)
-        end
-      else
-        vim.schedule(function()
-            update_floating_window(string.format("LLM Response took %.2f ms", elapsed_time_ms))
-        end)
-        local json_string = table.concat(j:result())
-        debug_write(opts, '\nRESPONSE full json (retval=' .. return_val .. '): ' .. json_string)
+    on_exit = function(j, return_val, signal)
+      if temp_file then
+          local success, err = pcall(os.remove, temp_file)
+          if not success then
+              print("Error deleting temporary file: " .. err)
+          end
       end
 
+      local end_time = vim.loop.hrtime()
+      local elapsed_time_ms = (end_time - start_time) / 1000000
+
+      local final_message
+      if signal then -- Job was killed by a signal
+          final_message = string.format("LLM Aborted (sig: %s) [%.0fms]", tostring(signal), elapsed_time_ms)
+          -- If job was manually shut down, `active_job` might be nil here if callback sequence is tricky
+          -- Check `j:is_shutdown_called()` if Plenary supports it, or a flag.
+      elseif return_val ~= 0 then
+        final_message = string.format("LLM Error (code: %s) [%.0fms]", tostring(return_val), elapsed_time_ms)
+      else
+        final_message = string.format("LLM Done [%.0fms]", elapsed_time_ms)
+      end
+
+      vim.schedule(function() update_floating_window(final_message) end)
+
+      -- Full response logging (might be very large)
+      -- local full_stdout = table.concat(j:result() or {}, '\n')
+      -- debug_write(opts, '\nRESPONSE full stdout (ret=' .. tostring(return_val) .. ', sig='..tostring(signal)..'):\n' .. full_stdout)
+      -- local full_stderr = table.concat(j:stderr_result() or {}, '\n')
+      -- debug_write(opts, '\nRESPONSE full stderr:\n' .. full_stderr)
+
       vim.defer_fn(function()
-        if vim.api.nvim_win_is_valid(win) then
-          vim.api.nvim_win_close(win, true)
+        if vim.api.nvim_win_is_valid(status_win) then
+          vim.api.nvim_win_close(status_win, true)
+        end
+        if vim.api.nvim_buf_is_valid(status_buf) then
+            vim.api.nvim_buf_delete(status_buf, {force = true})
         end
       end, 2750)
       active_job = nil
@@ -320,12 +428,11 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     pattern = 'DING_LLM_Escape',
     callback = function()
       if active_job then
-        active_job:shutdown()
-        update_floating_window("LLM streaming cancelled!")
-        vim.defer_fn(function()
-          vim.api.nvim_win_close(win, true)
-        end, 2500)
-        active_job = nil
+        vim.notify("dingllm: Cancelling LLM stream...", vim.log.levels.INFO, {title="DingLLM"})
+        active_job:shutdown() -- This will trigger on_exit with a signal
+        -- on_exit will handle updating the window and cleaning up.
+        -- update_floating_window("LLM: Cancelling...") -- on_exit will show final status
+        active_job = nil -- Mark as inactive immediately
       end
     end,
   })

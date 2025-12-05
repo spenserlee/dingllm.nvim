@@ -52,6 +52,10 @@ Add your API keys to your env (export it in zshrc or bashrc)
             local debug_path = '/tmp/dingllm_debug.log'
 
             local function gemeni_replace()
+                if not confirm_action("Proceed with LLM 'replace' operation?") then
+                    print("LLM 'replace' cancelled.")
+                    return
+                end
                 dingllm.invoke_llm_and_stream_into_editor({
                     url = beta_url,
                     model = g_model,
@@ -64,6 +68,17 @@ Add your API keys to your env (export it in zshrc or bashrc)
             end
 
             local function gemeni_help()
+                if not confirm_action("Proceed with LLM 'help' operation?") then
+                    print("LLM 'help' cancelled.")
+                    return
+                end
+
+                -- Optional: Automatically insert a separator so the LLM knows you are finished typing
+                -- This helps the "parse_gemini_history" function.
+                local row, _ = unpack(vim.api.nvim_win_get_cursor(0))
+                vim.api.nvim_buf_set_lines(0, row, row, false, { "", "## Model", "" })
+                vim.api.nvim_win_set_cursor(0, { row + 3, 0 })
+
                 dingllm.invoke_llm_and_stream_into_editor({
                     url = beta_url,
                     model = g_model,
@@ -80,6 +95,7 @@ Add your API keys to your env (export it in zshrc or bashrc)
         end,
     },
 ```
+
 ### Credits
 This extension woudln't exist if it weren't for https://github.com/melbaldove/llm.nvim
 

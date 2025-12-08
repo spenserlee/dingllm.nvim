@@ -126,6 +126,10 @@ function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
   return args, temp_file
 end
 
+local function write_to_messages(msg, level)
+  vim.notify(string.format("%s", msg), level)
+end
+
 function M.make_gemini_spec_curl_args(opts, prompt_data, system_prompt)
   local api_key = opts.api_key_name and get_api_key(opts.api_key_name)
   local url = opts.url .. "/" .. opts.model .. ":streamGenerateContent?alt=sse&key=" .. api_key
@@ -135,19 +139,18 @@ function M.make_gemini_spec_curl_args(opts, prompt_data, system_prompt)
   -- Logic: If we are replacing (Visual mode), prompt_data is a String.
   -- If we are Chatting (Normal mode), prompt_data is a Table of lines (for parsing).
   if opts.replace then
-      contents_payload = { { role = "user", parts = { { text = prompt_data } } } }
+    contents_payload = { { role = "user", parts = { { text = prompt_data } } } }
   else
-      -- It is a table of lines, parse it into history
-      if type(prompt_data) == "table" then
-        contents_payload = M.parse_gemini_history(prompt_data)
-      else
-        -- Fallback if something went wrong and a string was passed
-        contents_payload = { { role = "user", parts = { { text = prompt_data } } } }
-      end
+    -- It is a table of lines, parse it into history
+    if type(prompt_data) == "table" then
+      contents_payload = M.parse_gemini_history(prompt_data)
+    else
+      -- Fallback if something went wrong and a string was passed
+      contents_payload = { { role = "user", parts = { { text = prompt_data } } } }
+    end
   end
 
   local data = { contents = contents_payload }
-
   if system_prompt and system_prompt ~= "" then
     data.systemInstruction = { parts = { { text = system_prompt } } }
   end
@@ -155,19 +158,20 @@ function M.make_gemini_spec_curl_args(opts, prompt_data, system_prompt)
   local temp_file = vim.fn.tempname()
   local file, err = io.open(temp_file, "w")
   if not file then
-    print("Error creating temporary file: " .. err)
+    write_to_messages("Error creating temp file: " .. err, vim.log.levels.ERROR)
     return nil, nil
   end
 
   local success, write_err = pcall(function() file:write(vim.json.encode(data)) end)
   if not success then
-    print("Error writing to temporary file: " .. write_err)
+    write_to_messages("Error writing to temp file: " .. write_err, vim.log.levels.ERROR)
     file:close(); vim.fn.delete(temp_file)
     return nil, nil
   end
   file:close()
 
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@' .. temp_file }
+  -- Use '-s' (silent) and '-S' (show error) to prevent progress bar spam but keep errors
+  local args = { '-N', '-s', '-S', '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@' .. temp_file }
   table.insert(args, url)
   return args, temp_file
 end
@@ -182,8 +186,8 @@ function M.write_string_at_extmark(str, buf_id, extmark_id)
 
     local success, err = pcall(vim.cmd, 'undojoin')
     if not success and err and not err:match 'E790' then
-        -- Silently ignore E790 (undo join not allowed after undo), print others
-        print("Error in undojoin: " .. err)
+      -- Silently ignore E790 (undo join not allowed after undo), print others
+      print("Error in undojoin: " .. err)
     end
 
     local lines = vim.split(str, '\n')
@@ -243,10 +247,8 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
   local prompt_data = get_prompt(opts)
 
   -- Simple check for empty prompt
-  if type(prompt_data) == 'string' and prompt_data == '' then
-      vim.notify("Prompt is empty.", vim.log.levels.WARN); return
-  elseif type(prompt_data) == 'table' and #prompt_data == 0 then
-      vim.notify("Prompt is empty.", vim.log.levels.WARN); return
+  if (type(prompt_data) == 'string' and prompt_data == '') or (type(prompt_data) == 'table' and #prompt_data == 0) then
+    write_to_messages("Prompt is empty.", vim.log.levels.WARN); return
   end
 
   local system_prompt = opts.system_prompt or 'You are a helpful assistant.'
@@ -268,23 +270,46 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
   local status_win = vim.api.nvim_open_win(status_buf, false, status_win_opts)
   vim.api.nvim_win_set_option(status_win, 'winhl', 'Normal:NormalFloat,FloatBorder:NormalFloat')
 
+  -- Safe Window Updater (Handles newlines and resizing)
   local function update_floating_window(message)
     vim.schedule(function()
-       if not (vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf)) then return end
+      if not (vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf)) then return end
 
-       vim.api.nvim_buf_set_lines(status_buf, 0, -1, true, { message })
+      -- Ensure we have a table of lines
+      local lines = {}
+      if type(message) == "string" then
+          lines = vim.split(message, "\n")
+      else
+          lines = message
+      end
 
-       local new_width = math.max(initial_inner_win_width, vim.fn.strdisplaywidth(message))
-       local new_config = {
-         relative=status_win_opts.relative, row=status_win_opts.row, height=status_win_opts.height,
-         col = vim.o.columns - (new_width + 2), width = new_width
-       }
-       vim.api.nvim_win_set_config(status_win, new_config)
+      vim.api.nvim_buf_set_lines(status_buf, 0, -1, true, lines)
+
+      local max_width = initial_inner_win_width
+      for _, line in ipairs(lines) do
+          max_width = math.max(max_width, vim.fn.strdisplaywidth(line))
+      end
+      max_width = math.min(max_width, vim.o.columns - 4) -- Cap width
+
+      local new_height = math.max(1, #lines)
+
+      local new_config = {
+        relative=status_win_opts.relative,
+        row=status_win_opts.row,
+        col = vim.o.columns - (max_width + 2),
+        width = max_width,
+        height = new_height
+      }
+      vim.api.nvim_win_set_config(status_win, new_config)
     end)
   end
 
+  -- State for parsing
   local partial_data = nil
+  local error_buffer = {} -- Accumulate non-data lines to check for JSON errors later
+
   local function parse_and_call(line)
+    -- 1. Event line
     local event = line:match '^event: (.+)$'
     if event then
       curr_event_state = event
@@ -292,6 +317,7 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
       return
     end
 
+    -- 2. Data line
     local data_match = line:match '^data: (.+)$'
     if data_match then
       -- New data line detected.
@@ -302,8 +328,15 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
       -- No 'data:' prefix, but we have partial data waiting.
       -- This line is likely the second half of a split JSON string.
       partial_data = partial_data .. "\n" .. line
+    else
+      -- 3. Unknown line (Potential Error JSON Body)
+      -- If it doesn't start with data/event and we aren't building a partial, it might be a raw error body
+      if line ~= "" then
+        table.insert(error_buffer, line)
+      end
     end
 
+    -- 4. Partial data
     if partial_data then
       -- Try to decode. If it fails, we keep `partial_data` and wait for the next line.
       local success, _ = pcall(vim.json.decode, partial_data)
@@ -328,35 +361,67 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
       parse_and_call(out)
     end,
     on_stderr = function(_, err_line)
-       if err_line and err_line:match('^{"error":') then
-          local _, err_json = pcall(vim.json.decode, err_line)
-          local err_msg = (err_json and err_json.error and err_json.error.message) or err_line
-          update_floating_window("API Error: " .. err_msg)
-          debug_write(opts, "API ERROR: " .. err_msg)
+       -- Capture curl connection errors (e.g. DNS) that actually go to stderr
+       if err_line and err_line ~= "" then
+          table.insert(error_buffer, err_line)
        end
     end,
-    on_exit = function(j, return_val, signal)
+    on_exit = function(_, return_val, signal)
       vim.schedule(function()
-          if temp_file then os.remove(temp_file) end
+        if temp_file then os.remove(temp_file) end
+        local duration = (vim.loop.hrtime() - start_time) / 1000000
 
-          local duration = (vim.loop.hrtime() - start_time) / 1000000
-          local msg = (signal and "Aborted") or (return_val ~= 0 and "Error") or "Done"
-          msg = string.format("LLM %s [%.0fms]", msg, duration)
+        -- Check for API Errors (HTTP 429/400 often return 0 exit code but print JSON to stdout)
+        local api_error_msg = nil
+        if #error_buffer > 0 then
+            local combined_err = table.concat(error_buffer, "\n")
+            local success, err_json = pcall(vim.json.decode, combined_err)
+            if success and err_json.error then
+               api_error_msg = err_json.error.message or "Unknown API Error"
+               if err_json.error.code then api_error_msg = "["..err_json.error.code.."] " .. api_error_msg end
+            elseif return_val ~= 0 then
+               -- If not JSON, but exit code failed, show raw buffer
+               api_error_msg = combined_err
+            end
+        end
 
-          if vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf) then
-              vim.api.nvim_buf_set_lines(status_buf, 0, -1, true, { msg })
+        local msg = "Done"
+        if signal then msg = "Aborted"
+        elseif api_error_msg then msg = "API Error"
+        elseif return_val ~= 0 then msg = "Error"
+        end
+
+        msg = string.format("LLM %s [%.0fms]", msg, duration)
+
+        -- LOGGING TO :messages
+        if api_error_msg then
+          local first_line = vim.split(api_error_msg, "\n")[1]
+          local max_float_msg_len = 40
+          if #first_line > max_float_msg_len then
+              update_floating_window("Error: " .. (string.sub(first_line, 1, max_float_msg_len) .. "..."))
+          else
+              update_floating_window("Error: " .. first_line)
           end
 
-          -- Cleanup Window after delay
-          vim.defer_fn(function()
-            if vim.api.nvim_win_is_valid(status_win) then vim.api.nvim_win_close(status_win, true) end
-            if vim.api.nvim_buf_is_valid(status_buf) then vim.api.nvim_buf_delete(status_buf, {force=true}) end
-          end, 2000)
+          write_to_messages("API Failed: " .. first_line, vim.log.levels.ERROR)
+          debug_write(opts, "RESPONSE: " .. api_error_msg)
+        else
+          -- Only show "Done" in floating window, don't spam :messages unless desired
+          if vim.api.nvim_win_is_valid(status_win) and vim.api.nvim_buf_is_valid(status_buf) then
+              update_floating_window(msg)
+          end
+        end
 
-          -- Cleanup Keymap
-          pcall(vim.api.nvim_buf_del_keymap, buf_id, 'n', '<Esc>')
+        -- Cleanup Window after delay
+        vim.defer_fn(function()
+          if vim.api.nvim_win_is_valid(status_win) then vim.api.nvim_win_close(status_win, true) end
+          if vim.api.nvim_buf_is_valid(status_buf) then vim.api.nvim_buf_delete(status_buf, {force=true}) end
+        end, (api_error_msg and 5000 or 2000)) -- Keep window longer if error
 
-          active_job = nil
+        -- Cleanup Keymap
+        pcall(vim.api.nvim_buf_del_keymap, buf_id, 'n', '<Esc>')
+
+        active_job = nil
       end)
     end,
   }

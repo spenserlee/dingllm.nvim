@@ -283,15 +283,34 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     end)
   end
 
+  local partial_data = nil
   local function parse_and_call(line)
     local event = line:match '^event: (.+)$'
     if event then
       curr_event_state = event
+      partial_data = nil -- Reset partial data on new event
       return
     end
+
     local data_match = line:match '^data: (.+)$'
     if data_match then
-      handle_data_fn(data_match, buf_id, stream_end_extmark_id, curr_event_state)
+      -- New data line detected.
+      -- If we had previous partial data that failed to decode, we drop it here
+      -- (standard SSE behavior implies 'data:' is a new block).
+      partial_data = data_match
+    elseif partial_data then
+      -- No 'data:' prefix, but we have partial data waiting.
+      -- This line is likely the second half of a split JSON string.
+      partial_data = partial_data .. "\n" .. line
+    end
+
+    if partial_data then
+      -- Try to decode. If it fails, we keep `partial_data` and wait for the next line.
+      local success, _ = pcall(vim.json.decode, partial_data)
+      if success then
+        handle_data_fn(partial_data, buf_id, stream_end_extmark_id, curr_event_state)
+        partial_data = nil -- Clear buffer on success
+      end
     end
   end
 
